@@ -8,7 +8,7 @@ import numpy as np
 import json
 
 from core.data import make_synth, load_multi_curves, load_csv
-from core.engine import discover_strategies, backtest_portfolio
+from core.engine import discover_strategies, backtest_portfolio, discover_filters
 from core.metrics import (
     growth_index, stability_index, max_drawdown, sharpe, equity_from_position
 )
@@ -18,6 +18,7 @@ from core.optimizer import optimize_strategy
 st.set_page_config(page_title="StratWorkbench", layout="wide", page_icon="🧪")
 
 STRATS_DIR = str(pathlib.Path(__file__).resolve().parent / "strats")
+FILTER_DIR = str(pathlib.Path(__file__).resolve().parent / "filter")
 
 if "__params" not in st.session_state:
     st.session_state["__params"] = {}
@@ -30,9 +31,31 @@ if "last_config" not in st.session_state:
 HIGHLIGHT = "#a9955ba6"
 HIGHLIGHT2 = "#b6863f"
 
+# ------------------ Helpers: synth + jitter déterministe ------------------
+_SYNTH_KIND_SEED = {
+    "sideways": 11,
+    "slow_grind": 23,
+    "trend_down": 37,
+    "trend_up": 53,
+    "volatile_whipsaw": 71,
+}
+def make_with_jitter(kind: str, n_points: int, seed: int, jitter_pct: float) -> pd.DataFrame:
+    df = make_synth(n=n_points, kind=kind, seed=seed)
+    if jitter_pct and jitter_pct > 0:
+        base_seed = int(seed * 10007 + _SYNTH_KIND_SEED.get(kind, 97)) % (2**32)
+        rng = np.random.default_rng(base_seed)
+        noise = pd.Series(rng.normal(0, jitter_pct / 1000.0, size=len(df)), index=df.index)
+        noise = noise.rolling(window=10, min_periods=1).mean()
+        df["close"] *= (1 + noise)
+        df["open"] = df["close"].shift(1).fillna(df["close"])
+        absn = noise.abs()
+        df["high"] = df[["open", "close"]].max(axis=1) * (1 + absn / 2)
+        df["low"]  = df[["open", "close"]].min(axis=1) * (1 - absn / 2)
+    return df
+
 # ------------------ Sidebar ------------------
 st.sidebar.title("⚙️ Paramètres")
-st.sidebar.caption("Auto-détection des stratégies dans /strats")
+st.sidebar.caption("Auto-détection des stratégies dans /strats et des filtres dans /filter")
 
 data_mode = st.sidebar.radio("Source des données", ["Synthétique", "Réelles (CSV)"])
 dfs = {}  # {label: DataFrame}
@@ -46,17 +69,8 @@ if data_mode == "Synthétique":
     synth_seed = st.sidebar.number_input("Seed (0 = aléatoire)", value=123, min_value=0)
     jitter_pct = st.sidebar.slider("Jitter (%)", 0.0, 5.0, 0.0, 0.1)
 
-    seed = np.random.randint(0, 1_000_000) if synth_seed == 0 else synth_seed
-    df_base = make_synth(n=n_points, kind=curve_kind, seed=seed)
-
-    if jitter_pct > 0:
-        noise = pd.Series(np.random.normal(0, jitter_pct / 1000, size=len(df_base)))
-        noise = noise.rolling(window=10, min_periods=1).mean()
-        df_base["close"] *= (1 + noise)
-        df_base["open"] = df_base["close"].shift(1).fillna(df_base["close"])
-        df_base["high"] = df_base[["open", "close"]].max(axis=1) * (1 + abs(noise) / 2)
-        df_base["low"] = df_base[["open", "close"]].min(axis=1) * (1 - abs(noise) / 2)
-
+    seed = np.random.randint(0, 1_000_000) if synth_seed == 0 else int(synth_seed)
+    df_base = make_with_jitter(curve_kind, n_points, seed, jitter_pct)
     dfs = {curve_kind: df_base}
 
 else:
@@ -118,6 +132,47 @@ display_mode = st.sidebar.radio(
     ["Équité (portefeuille)", "Prix (actif)", "Équité par stratégie"],
 )
 
+# ------------------ Filtres de risque ------------------
+st.sidebar.subheader("Filtres de risque")
+filters_infos = discover_filters(FILTER_DIR)
+active_filters: list[tuple[object, dict]] = []
+if not filters_infos:
+    st.sidebar.caption("Aucun filtre dans /filter")
+else:
+    for name, info in filters_infos.items():
+        if st.sidebar.checkbox(f"Filtre — {name}", value=False):
+            with st.sidebar.expander(f"Paramètres — {name}", expanded=False):
+                params = st.session_state["__params"].get(f"[FILTER]{name}", {})
+                new_params: dict = {}
+                for p, s in info.params_schema.items():
+                    t = s.get("type")
+                    if t == "int":
+                        new_params[p] = st.slider(
+                            p, int(s.get("min", 0)), int(s.get("max", 100)),
+                            int(params.get(p, s.get("default", 0))),
+                            int(s.get("step", 1)), key=f"param::F::{name}::{p}"
+                        )
+                    elif t == "float":
+                        new_params[p] = st.slider(
+                            p, float(s.get("min", 0.0)), float(s.get("max", 1.0)),
+                            float(params.get(p, s.get("default", 0.0))),
+                            float(s.get("step", 0.1)), key=f"param::F::{name}::{p}"
+                        )
+                    else:
+                        new_params[p] = st.text_input(
+                            p, value=str(params.get(p, s.get("default", ""))),
+                            key=f"param::F::{name}::{p}"
+                        )
+                st.session_state["__params"][f"[FILTER]{name}"] = new_params
+                active_filters.append((info.ref, new_params))
+
+# ------------------ Coûts de transaction ------------------
+st.sidebar.subheader("Coûts de transaction")
+fee_bps = st.sidebar.number_input("Commission (bps, 1 = 0,01%)", min_value=0.0, max_value=200.0, value=10.0, step=0.5)
+spread_bps = st.sidebar.number_input("Spread (bps, one-way)", min_value=0.0, max_value=200.0, value=5.0, step=0.5)
+slippage_bps = st.sidebar.number_input("Slippage (bps, one-way)", min_value=0.0, max_value=200.0, value=2.0, step=0.5)
+fee_on_sell_only = st.sidebar.checkbox("Commission à la vente uniquement", value=False)
+
 # ------------------ Header ------------------
 st.title("🧪 StratWorkbench — Combiner, paramétrer, benchmarker")
 colKPI1, colKPI2, colKPI3 = st.columns(3)
@@ -159,7 +214,10 @@ st.markdown("---")
 # ------------------ Backtest ------------------
 if dfs and active:
     label, df0 = list(dfs.items())[0]
-    equity, stats, per = backtest_portfolio(df0, active, cash_start=10_000.0)
+    equity, stats, per = backtest_portfolio(
+        df0, active, cash_start=10_000.0, filters=active_filters,
+        fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+    )
     gi, si = growth_index(equity), stability_index(equity)
     kpi_port.metric("Portefeuille", f"{equity.iloc[-1]:,.0f} €")
     kpi_growth.metric("Indice de croissance", f"{gi:.0f}")
@@ -169,10 +227,15 @@ else:
 
 # ------------------ Invalidation automatique benchmark ------------------
 current_config = {
-    "seed": synth_seed if data_mode == "Synthétique" else None,
-    "jitter": jitter_pct if data_mode == "Synthétique" else None,
+    "seed": (locals().get("synth_seed") if data_mode == "Synthétique" else None),
+    "n_points": (locals().get("n_points") if data_mode == "Synthétique" else None),
+    "jitter": (locals().get("jitter_pct") if data_mode == "Synthétique" else None),
+    "curve_kind": (locals().get("curve_kind") if data_mode == "Synthétique" else None),
     "strategies": active_names,
-    "params": {k: st.session_state["__params"].get(k, {}) for k in active_names}
+    "params": {k: st.session_state["__params"].get(k, {}) for k in active_names},
+    "filters": {f"[FILTER]{getattr(ref,'NAME',str(ref))}": params for ref, params in active_filters},
+    "fees": dict(fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only),
+    "time_filter": time_filter,
 }
 if current_config != st.session_state["last_config"]:
     st.session_state["benchmark_results"] = None
@@ -185,7 +248,10 @@ if dfs:
         for sym, dfi in dfs.items():
             dfi_filtered = apply_time_filter(dfi, time_filter)
             if sym in selected_symbols:
-                eq, _, _ = backtest_portfolio(dfi_filtered, active, cash_start=10_000.0)
+                eq, _, _ = backtest_portfolio(
+                    dfi_filtered, active, cash_start=10_000.0, filters=active_filters,
+                    fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                )
                 fig.add_trace(go.Scatter(x=dfi_filtered.index, y=eq, mode="lines", name=f"Équité {sym}"))
     elif display_mode == "Prix (actif)":
         for sym, dfi in dfs.items():
@@ -195,8 +261,10 @@ if dfs:
 
                 if triangle_strategy != "Aucune":
                     for ref, params in active:
-                        if ref.NAME == triangle_strategy:
+                        if getattr(ref, "NAME", "") == triangle_strategy:
                             pos = ref.generate_signals(dfi_filtered, params)
+                            for fref, fparams in active_filters:
+                                pos = fref.apply(dfi_filtered, pos, fparams)
                             entries = pos[(pos.shift(1) == 0) & (pos == 1)].index
                             exits   = pos[(pos.shift(1) == 1) & (pos == 0)].index
 
@@ -204,13 +272,13 @@ if dfs:
                                 x=entries, y=dfi_filtered.loc[entries, "close"],
                                 mode="markers", marker_symbol="triangle-up",
                                 marker_color="green", marker_size=10,
-                                name=f"Achat — {ref.NAME}"
+                                name=f"Achat — {getattr(ref,'NAME','')}"
                             ))
                             fig.add_trace(go.Scatter(
                                 x=exits, y=dfi_filtered.loc[exits, "close"],
                                 mode="markers", marker_symbol="triangle-down",
                                 marker_color="red", marker_size=10,
-                                name=f"Vente — {ref.NAME}"
+                                name=f"Vente — {getattr(ref,'NAME','')}"
                             ))
 
                             nb_trades = int(((pos.diff().fillna(0) != 0).sum()) // 2)
@@ -229,7 +297,7 @@ if dfs:
     else:
         if per:
             for name, eq in per.items():
-                fig.add_trace(go.Scatter(x=df0.index, y=eq, mode="lines", name=f"Équité — {name}"))
+                fig.add_trace(go.Scatter(x=list(dfs.values())[0].index, y=eq, mode="lines", name=f"Équité — {name}"))
     fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
     st.plotly_chart(fig, use_container_width=True)
 
@@ -242,23 +310,33 @@ with st.expander("🚀 Benchmark multi-courbes", expanded=False):
             st.warning("Charge des données pour lancer le benchmark.")
         else:
             if data_mode == "Synthétique":
-                seed = np.random.randint(0, 1_000_000) if synth_seed == 0 else synth_seed
-                bench_dfs = load_multi_curves(n=1500, seed=seed)
+                seed = int(locals().get("synth_seed", 123))
+                seed = np.random.randint(0, 1_000_000) if seed == 0 else seed
+                n_points = int(locals().get("n_points", 1500))
+                jitter_pct = float(locals().get("jitter_pct", 0.0))
+                kinds = ["sideways","slow_grind","trend_down","trend_up","volatile_whipsaw"]
+                bench_dfs = {k: make_with_jitter(k, n_points, seed, jitter_pct) for k in kinds}
             else:
                 bench_dfs = dfs
 
             rows = []
             for label, dfi in bench_dfs.items():
+                dfi_filtered = apply_time_filter(dfi, time_filter)
                 for ref, params in active:
-                    pos = ref.generate_signals(dfi, params)
-                    eqi = equity_from_position(dfi, pos, cash_start=10_000.0)
+                    pos = ref.generate_signals(dfi_filtered, params)
+                    for fref, fparams in active_filters:
+                        pos = fref.apply(dfi_filtered, pos, fparams)
+                    eqi = equity_from_position(
+                        dfi_filtered, pos, cash_start=10_000.0,
+                        fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                    )
 
                     changes = (pos.diff().fillna(0) != 0).sum()
                     nb_trades = int(changes // 2)
-                    if isinstance(dfi.index, pd.DatetimeIndex):
-                        n_days = max(1, (dfi.index[-1] - dfi.index[0]).days)
+                    if isinstance(dfi_filtered.index, pd.DatetimeIndex):
+                        n_days = max(1, (dfi_filtered.index[-1] - dfi_filtered.index[0]).days)
                     else:
-                        n_days = max(1, len(dfi) // 100)
+                        n_days = max(1, len(dfi_filtered) // 100)
                     trades_per_day = nb_trades / n_days
 
                     rows.append({
@@ -273,6 +351,51 @@ with st.expander("🚀 Benchmark multi-courbes", expanded=False):
                         "trades_per_day": trades_per_day,
                     })
             st.session_state["benchmark_results"] = pd.DataFrame(rows).set_index(["courbe", "strat"])
+
+    # Recalcul automatique si nécessaire
+    if st.session_state["benchmark_results"] is None and dfs and active:
+        if data_mode == "Synthétique":
+            seed = int(locals().get("synth_seed", 123))
+            seed = np.random.randint(0, 1_000_000) if seed == 0 else seed
+            n_points = int(locals().get("n_points", 1500))
+            jitter_pct = float(locals().get("jitter_pct", 0.0))
+            kinds = ["sideways","slow_grind","trend_down","trend_up","volatile_whipsaw"]
+            bench_dfs = {k: make_with_jitter(k, n_points, seed, jitter_pct) for k in kinds}
+        else:
+            bench_dfs = dfs
+
+        rows = []
+        for label, dfi in bench_dfs.items():
+            dfi_filtered = apply_time_filter(dfi, time_filter)
+            for ref, params in active:
+                pos = ref.generate_signals(dfi_filtered, params)
+                for fref, fparams in active_filters:
+                    pos = fref.apply(dfi_filtered, pos, fparams)
+                eqi = equity_from_position(
+                    dfi_filtered, pos, cash_start=10_000.0,
+                    fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                )
+
+                changes = (pos.diff().fillna(0) != 0).sum()
+                nb_trades = int(changes // 2)
+                if isinstance(dfi_filtered.index, pd.DatetimeIndex):
+                    n_days = max(1, (dfi_filtered.index[-1] - dfi_filtered.index[0]).days)
+                else:
+                    n_days = max(1, len(dfi_filtered) // 100)
+                trades_per_day = nb_trades / n_days
+
+                rows.append({
+                    "courbe": label,
+                    "strat": getattr(ref, "NAME", str(ref)),
+                    "final": float(eqi.iloc[-1]),
+                    "growth_idx": growth_index(eqi),
+                    "stability_idx": stability_index(eqi),
+                    "dd_min": float(max_drawdown(eqi)),
+                    "sharpe": float(sharpe(eqi)),
+                    "trades": nb_trades,
+                    "trades_per_day": trades_per_day,
+                })
+        st.session_state["benchmark_results"] = pd.DataFrame(rows).set_index(["courbe", "strat"])
 
     if st.session_state["benchmark_results"] is not None:
         res = st.session_state["benchmark_results"]
@@ -292,13 +415,6 @@ with st.expander("🚀 Benchmark multi-courbes", expanded=False):
             col3.dataframe(res["growth_idx"].unstack().style.format("{:.0f}").highlight_max(axis=1, color=HIGHLIGHT2))
             col4.caption("Indice de stabilité (0–100)")
             col4.dataframe(res["stability_idx"].unstack().style.format("{:.0f}").highlight_max(axis=1, color=HIGHLIGHT2))
-
-        with st.expander("📊 Activité de trading"):
-            col1, col2 = st.columns(2)
-            col1.caption("Nombre total de trades (round-trips)")
-            col1.dataframe(res["trades"].unstack().style.format("{:,.0f}").highlight_max(axis=1, color=HIGHLIGHT2))
-            col2.caption("Nombre moyen de trades par jour")
-            col2.dataframe(res["trades_per_day"].unstack().style.format("{:.2f}").highlight_max(axis=1, color=HIGHLIGHT2))
 
         # ------------------ Classements supplémentaires ------------------
         best = (
@@ -359,5 +475,5 @@ if st.button("🔍 Auto-calcul best values"):
 # ------------------ Footer ------------------
 st.caption(
     """Astuce : utilisez le menu **Type de courbe** (à gauche) pour passer de l'**Équité**
-au **Prix** ou à l'**Équité par stratégie**. Ajoutez vos propres stratégies dans `/strats`."""
+au **Prix** ou à l'**Équité par stratégie**. Ajoutez vos propres stratégies dans `/strats` et vos filtres de risque dans `/filter`."""
 )
