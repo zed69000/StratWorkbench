@@ -548,6 +548,7 @@ if objective == "Composite":
     w_sharpe = st.slider("Poids — Sharpe",        0.0, 3.0, 1.0, 0.1)
     w_dd     = st.slider("Poids — |Drawdown|",    0.0, 3.0, 1.0, 0.1)
 
+
 if st.button("🔍 Auto-calcul best values"):
     if not dfs or not active_names:
         st.warning("Charge des données et coche au moins une stratégie.")
@@ -555,32 +556,44 @@ if st.button("🔍 Auto-calcul best values"):
         best_params = {}
         df_ref = list(dfs.values())[0]
 
-        for name in active_names:
-            info = infos[name]
-            st.write(f"Optimisation '{name}'…")
-            best = optimize_strategy(
-                df_ref, info,
-                cash_start=10_000.0,
-                max_combos=max_combos,
-                fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps,
-                fee_on_sell_only=fee_on_sell_only,
-                filters=active_filters,
-                optimize_filters=opt_filters,
-                objective=(
-                    "sharpe" if objective == "Sharpe" else
-                    "final"  if objective == "Équité finale" else
-                    "dd"     if objective == "Drawdown min" else
-                    "growth" if objective == "Indice croissance" else
-                    "stability" if objective == "Indice stabilité" else
-                    "composite"
-                ),
-                weights={"final": w_final, "sharpe": w_sharpe, "dd": w_dd} if objective == "Composite" else None,
-            )
-            best_params[name] = {k: v for k, v in best.items() if k in ("params","final","sharpe","dd","growth","stab")}
+        # Barre de progression par stratégie
+        total = len(active_names)
+        progress = st.progress(0)
+        status = st.empty()
 
+        for i, name in enumerate(active_names, start=1):
+            info = infos[name]
+            status.text(f"Optimisation {i}/{total} — {name}")
+            with st.spinner(f"Optimisation '{name}' en cours"):
+                best = optimize_strategy(
+                    df_ref, info,
+                    cash_start=10_000.0,
+                    max_combos=max_combos,
+                    fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps,
+                    fee_on_sell_only=fee_on_sell_only,
+                    filters=active_filters,
+                    optimize_filters=opt_filters,
+                    objective=(
+                        "sharpe" if objective == "Sharpe" else
+                        "final"  if objective == "Équité finale" else
+                        "dd"     if objective == "Drawdown min" else
+                        "growth" if objective == "Indice croissance" else
+                        "stability" if objective == "Indice stabilité" else
+                        "composite"
+                    ),
+                    weights={"final": w_final, "sharpe": w_sharpe, "dd": w_dd} if objective == "Composite" else None,
+                )
+
+            # Mémorise
+            best_params[name] = {k: v for k, v in best.items() if k in ("params","final","sharpe","dd","growth","stab")}
             if "params" in best:
                 st.session_state["__params"][name] = best["params"]
 
+            progress.progress(int(i * 100 / max(1, total)))
+
+        status.text("Optimisation terminée")
+
+        # Applique paramètres de filtres si optimisés
         if opt_filters and 'best' in locals() and "filters_params" in best:
             for (fref, _), fparams in zip(active_filters, best["filters_params"]):
                 st.session_state["__params"][f"[FILTER]{getattr(fref,'NAME',str(fref))}"] = fparams
