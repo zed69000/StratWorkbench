@@ -457,33 +457,69 @@ with st.expander("🚀 Benchmark multi-courbes", expanded=False):
         st.dataframe(pivot_all)
 
 # ------------------ Optimisation auto ------------------
-# ------------------ Optimisation auto ------------------
 st.markdown("### 🤖 Auto-calcul des meilleurs paramètres")
-if st.button("🔍 Auto-calcul best values (strats sélectionnées)"):
-    if not dfs or not active_names:
-        st.warning("Active au moins une stratégie et charge des données.")
-    else:
-        # Data de référence = 1er symbole sélectionné sinon 1er dispo, + filtre temps
-        base_label = selected_symbols[0] if selected_symbols else list(dfs.keys())[0]
-        dfi = apply_time_filter(dfs[base_label], time_filter)
 
+colA, colB, colC = st.columns(3)
+objective = colA.selectbox(
+    "Critère",
+    ["Sharpe", "Équité finale", "Drawdown min", "Indice croissance", "Indice stabilité", "Composite"],
+    index=0,
+)
+opt_filters = colB.checkbox("Optimiser aussi les filtres actifs", value=False)
+max_combos = int(colC.number_input("Budget combos max", min_value=50, max_value=100_000, value=2000, step=50))
+
+w_final = w_sharpe = w_dd = 1.0
+if objective == "Composite":
+    w_final  = st.slider("Poids — Équité finale", 0.0, 3.0, 1.0, 0.1)
+    w_sharpe = st.slider("Poids — Sharpe",        0.0, 3.0, 1.0, 0.1)
+    w_dd     = st.slider("Poids — |Drawdown|",    0.0, 3.0, 1.0, 0.1)
+
+if st.button("🔍 Auto-calcul best values"):
+    if not dfs or not active_names:
+        st.warning("Charge des données et coche au moins une stratégie.")
+    else:
         best_params = {}
+        # Première courbe comme référence d’optimisation
+        df_ref = list(dfs.values())[0]
+
+        # mapping nom -> info
         for name in active_names:
             info = infos[name]
-            st.write(f"Optimisation {name}…")
+            st.write(f"Optimisation '{name}'…")
             best = optimize_strategy(
-                dfi, info, cash_start=10_000.0,
+                df_ref, info,
+                cash_start=10_000.0,
+                max_combos=max_combos,
                 fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps,
-                fee_on_sell_only=fee_on_sell_only, filters=active_filters
-            ) or {}
-            best_params[name] = best
-            if best.get("params"):
+                fee_on_sell_only=fee_on_sell_only,
+                filters=active_filters,
+                optimize_filters=opt_filters,
+                objective=(
+                    "sharpe" if objective == "Sharpe" else
+                    "final"  if objective == "Équité finale" else
+                    "dd"     if objective == "Drawdown min" else
+                    "growth" if objective == "Indice croissance" else
+                    "stability" if objective == "Indice stabilité" else
+                    "composite"
+                ),
+                weights={"final": w_final, "sharpe": w_sharpe, "dd": w_dd} if objective == "Composite" else None,
+            )
+            best_params[name] = {k: v for k, v in best.items() if k in ("params","final","sharpe","dd","growth","stab")}
+
+            # Applique paramètres stratégie
+            if "params" in best:
                 st.session_state["__params"][name] = best["params"]
+
+        # Applique paramètres de filtres si optimisés
+        if opt_filters and active_filters and "filters_params" in best:
+            for (fref, _), fparams in zip(active_filters, best["filters_params"]):
+                st.session_state["__params"][f"[FILTER]{getattr(fref,'NAME',str(fref))}"] = fparams
 
         st.json(best_params)
         with open("best_params.json", "w") as f:
             json.dump(best_params, f, indent=2)
-        st.success("✅ Paramètres appliqués pour les stratégies sélectionnées")
+        st.success("✅ Paramètres appliqués et sauvegardés (best_params.json)")
+
 
 
 # ------------------ Footer ------------------
