@@ -1,73 +1,84 @@
 from __future__ import annotations
-import numpy as np
-import pandas as pd
+import numpy as np, pandas as pd
+
+def equity_from_position(
+    df: pd.DataFrame,
+    position: pd.Series,
+    cash_start: float = 10_000.0,
+    fee_bps: float = 0.0,
+    spread_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    fee_on_sell_only: bool = False,
+    stop_loss_pct: float | None = None,
+) -> pd.Series:
+    price = df["close"].astype(float)
+    pos = pd.Series(0.0, index=price.index, name="position")
+    if position is not None:
+        pos = position.reindex(price.index).fillna(0.0).clip(-1, 1).astype(float)
+
+    # Stop loss discret à la clôture
+    if stop_loss_pct is not None and stop_loss_pct > 0:
+        pos_sl = pos.copy()
+        state = 0.0
+        entry = np.nan
+        for i, px in enumerate(price.values):
+            p = pos_sl.iloc[i]
+            if p != state:
+                state = p
+                entry = px if state != 0 else np.nan
+            elif state != 0 and entry == entry:
+                pnl = (px / entry - 1.0) * np.sign(state)
+                if pnl <= -float(stop_loss_pct):
+                    pos_sl.iloc[i] = 0.0
+                    state = 0.0
+                    entry = np.nan
+        pos = pos_sl
+
+    # Rendement brut (exposition t-1)
+    ret_gross = pos.shift(1).fillna(0.0) * price.pct_change().fillna(0.0)
+
+    # Coûts: variation d'exposition
+    delta = pos.diff().fillna(pos.iloc[0])
+    buy  = delta.clip(lower=0.0)
+    sell = (-delta).clip(lower=0.0)
+
+    commission = (sell if fee_on_sell_only else (buy + sell)) * (fee_bps / 10_000.0)
+    frictions  = (buy + sell) * ((spread_bps + slippage_bps) / 10_000.0)
+    cost = commission + frictions
+
+    eq = (1.0 + ret_gross - cost).cumprod() * cash_start
+    return eq.rename("equity")
+
 
 def max_drawdown(equity: pd.Series) -> float:
-    cummax = equity.cummax()
-    dd = (equity / cummax) - 1.0
+    if equity is None or len(equity) == 0:
+        return 0.0
+    s = equity.astype(float)
+    roll_max = s.cummax()
+    dd = (s / roll_max - 1.0).fillna(0.0)
     return float(dd.min())
 
-def sharpe(equity: pd.Series, periods_per_year: int = 252) -> float:
-    rets = equity.pct_change().fillna(0.0)
-    mu = rets.mean() * periods_per_year
-    sigma = rets.std(ddof=0) * np.sqrt(periods_per_year)
-    if sigma == 0:
+
+def sharpe(equity: pd.Series, rf: float = 0.0) -> float:
+    if equity is None or len(equity) < 2:
         return 0.0
-    return float(mu / sigma)
+    rets = equity.pct_change().dropna()
+    if len(rets) < 2:
+        return 0.0
+    vol = rets.std()
+    if vol == 0:
+        return 0.0
+    return float(np.sqrt(252.0) * (rets.mean() - rf) / (vol + 1e-12))
+
 
 def growth_index(equity: pd.Series) -> float:
-    perf = float(equity.iloc[-1] / equity.iloc[0] - 1.0) if len(equity) > 1 else 0.0
-    return float(50.0 + 50.0 * np.tanh(perf))
+    if equity is None or len(equity) == 0:
+        return 0.0
+    total = float(equity.iloc[-1] / equity.iloc[0] - 1.0)
+    return float(np.clip(50.0 + 50.0 * np.tanh(total), 0.0, 100.0))
+
 
 def stability_index(equity: pd.Series) -> float:
     s = sharpe(equity)
-    dd = max_drawdown(equity)  # négatif
-    score = 50.0 + 30.0 * np.tanh(s / 2.0) + 20.0 * (1.0 + dd)
-    return float(np.clip(score, 0.0, 100.0))
-
-def equity_from_position(df: pd.DataFrame,
-                         position: pd.Series,
-                         cash_start: float = 10_000.0,
-                         fee_bps: float = 0.0,
-                         spread_bps: float = 0.0,
-                         slippage_bps: float = 0.0,
-                         fee_on_sell_only: bool = False) -> pd.Series:
-    """
-    Backtest vectoriel simple avec coûts de transaction.
-    - position: série [-1,0,1], appliquée en *t* sur le retour de *t->t+1*.
-    - frais: appliqués lors des *changements* de position (turnover).
-      coût = (fee + spread + slippage) * turnover * equity.
-    - fee_on_sell_only: si True, commission uniquement quand delta<0 (réduction/vente).
-    Notes:
-      1 bps = 0.01%. spread_bps est one-way (moitié de l'écart).
-    """
-    pos = position.reindex(df.index).fillna(0.0).clip(-1, 1).astype(float)
-    close = df["close"].astype(float)
-    r = close.pct_change().fillna(0.0).to_numpy()
-
-    one_way_cost = (float(fee_bps) + float(spread_bps) + float(slippage_bps)) / 10_000.0
-
-    eq = np.empty(len(pos), dtype=float)
-    eq[0] = float(cash_start)
-
-    pos_vals = pos.to_numpy()
-    for i in range(1, len(pos_vals)):
-        pos_prev = pos_vals[i-1]
-        pos_now  = pos_vals[i]
-
-        # coût de changement de position au début de la barre i
-        delta = pos_now - pos_prev
-        if delta != 0.0:
-            apply_cost = True
-            if fee_on_sell_only:
-                apply_cost = (delta < 0)  # réduction/vente nette
-            if apply_cost:
-                cost = abs(delta) * one_way_cost * eq[i-1]
-                eq[i-1] -= cost
-                if eq[i-1] < 0:
-                    eq[i-1] = 0.0
-
-        # performance de la barre i avec la position détenue sur la barre i-1
-        eq[i] = eq[i-1] * (1.0 + pos_prev * r[i])
-
-    return pd.Series(eq, index=pos.index, name="equity")
+    dd = max_drawdown(equity)
+    return float(np.clip(50.0 + 30.0 * np.tanh(s / 2.0) + 20.0 * (1.0 + dd), 0.0, 100.0))

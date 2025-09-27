@@ -9,12 +9,12 @@ from .metrics import equity_from_position
 @dataclass
 class StrategyInfo:
     module_name: str
-    ref: Any          # module exposing NAME, PARAMS_SCHEMA, generate_signals
+    ref: Any
     name: str
     params_schema: dict
 
 def _module_has_strategy(mod) -> bool:
-    return hasattr(mod, 'NAME') and hasattr(mod, 'PARAMS_SCHEMA') and hasattr(mod, 'generate_signals')
+    return all(hasattr(mod, a) for a in ("NAME", "PARAMS_SCHEMA", "generate_signals"))
 
 def discover_strategies(strats_dir: str) -> Dict[str, StrategyInfo]:
     path = pathlib.Path(strats_dir)
@@ -22,7 +22,7 @@ def discover_strategies(strats_dir: str) -> Dict[str, StrategyInfo]:
         sys.path.insert(0, str(path.resolve()))
     found: Dict[str, StrategyInfo] = {}
     for pyfile in path.glob("*.py"):
-        if pyfile.name.startswith("_"):  # ignore __init__ etc.
+        if pyfile.name.startswith("_"):
             continue
         spec = importlib.util.spec_from_file_location(pyfile.stem, pyfile)
         mod = importlib.util.module_from_spec(spec)
@@ -33,25 +33,18 @@ def discover_strategies(strats_dir: str) -> Dict[str, StrategyInfo]:
             print(f"[DISCOVER] Import error {pyfile.name}: {e}")
             continue
         if _module_has_strategy(mod):
-            name = getattr(mod, 'NAME')
-            schema = getattr(mod, 'PARAMS_SCHEMA')
-            found[name] = StrategyInfo(module_name=mod.__name__, ref=mod, name=name, params_schema=schema)
-            print(f"[DISCOVER] OK: {name}")
-        else:
-            print(f"[DISCOVER] Skip {pyfile.name}: no NAME/PARAMS_SCHEMA/generate_signals")
+            found[mod.NAME] = StrategyInfo(mod.__name__, mod, mod.NAME, getattr(mod, "PARAMS_SCHEMA", {}))
     return found
-
-# ---------- Gestion des filtres (overlay de risque) ----------
 
 @dataclass
 class FilterInfo:
     module_name: str
-    ref: Any           # module with NAME, PARAMS_SCHEMA, apply(df, position, params)
+    ref: Any
     name: str
     params_schema: dict
 
 def _module_has_filter(mod) -> bool:
-    return hasattr(mod, 'NAME') and hasattr(mod, 'PARAMS_SCHEMA') and hasattr(mod, 'apply')
+    return all(hasattr(mod, a) for a in ("NAME", "PARAMS_SCHEMA", "apply"))
 
 def discover_filters(filter_dir: str) -> Dict[str, FilterInfo]:
     path = pathlib.Path(filter_dir)
@@ -69,57 +62,45 @@ def discover_filters(filter_dir: str) -> Dict[str, FilterInfo]:
             assert spec.loader is not None
             spec.loader.exec_module(mod)  # type: ignore
         except Exception as e:
-            print(f"[FILTER DISCOVER] Import error {pyfile.name}: {e}")
+            print(f"[FILTER] Import error {pyfile.name}: {e}")
             continue
         if _module_has_filter(mod):
-            name = getattr(mod, 'NAME')
-            schema = getattr(mod, 'PARAMS_SCHEMA')
-            found[name] = FilterInfo(module_name=mod.__name__, ref=mod, name=name, params_schema=schema)
-            print(f"[FILTER DISCOVER] OK: {name}")
-        else:
-            print(f"[FILTER DISCOVER] Skip {pyfile.name}: missing NAME/PARAMS_SCHEMA/apply")
+            found[mod.NAME] = FilterInfo(mod.__name__, mod, mod.NAME, getattr(mod, "PARAMS_SCHEMA", {}))
     return found
 
 def run_strategy(df: pd.DataFrame, strat_ref, params: dict) -> pd.Series:
-    pos = strat_ref.generate_signals(df, params)
+    pos = strat_ref.generate_signals(df, params or {})
+    if not isinstance(pos, pd.Series):
+        pos = pd.Series(pos, index=df.index)
+    return pos.rename("position").clip(-1, 1).astype(float)
 
-    # 🔒 Sécurité si une stratégie renvoie None
-    if pos is None:
-        pos = pd.Series(0.0, index=df.index, name="position")
-
-    elif not isinstance(pos, pd.Series):
-        pos = pd.Series(pos, index=df.index, name="position")
-    else:
-        pos = pos.reindex(df.index)
-
-    return pos.fillna(0.0).clip(-1, 1)
-
-def backtest_portfolio(df: pd.DataFrame,
-                       active: List[Tuple[object, dict]],
-                       cash_start=10_000.0,
-                       filters: List[Tuple[object, dict]] | None = None,
-                       fee_bps: float = 0.0, spread_bps: float = 0.0, slippage_bps: float = 0.0, fee_on_sell_only: bool = False):
-    """
-    Applique les stratégies, puis applique séquentiellement chaque filtre sur la position,
-    puis calcule l'équité. Les filtres agissent comme overlay de gestion du risque.
-    """
+def backtest_portfolio(
+    df: pd.DataFrame,
+    active: List[Tuple[Any, dict]],
+    cash_start: float = 10_000.0,
+    filters: List[Tuple[Any, dict]] | None = None,
+    fee_bps: float = 0.0,
+    spread_bps: float = 0.0,
+    slippage_bps: float = 0.0,
+    fee_on_sell_only: bool = False,
+    stop_loss_pct: float | None = None,
+):
     if not active:
         eq = pd.Series([cash_start] * len(df), index=df.index, name='equity')
         return eq, {}, {}
-    w = 1.0 / max(1, len(active))
+    w = 1.0 / len(active)
     equities = []
     stats = {}
     per = {}
     for ref, params in active:
         pos = run_strategy(df, ref, params)
-        if filters:
-            for fref, fparams in filters:
-                try:
-                    pos = fref.apply(df, pos, fparams)
-                except Exception as e:
-                    print(f"[FILTER ERROR] {getattr(fref,'NAME',fref)}: {e}")
-        eq = equity_from_position(df, pos, cash_start=cash_start * w,
-                                  fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only)
+        for fref, fparams in (filters or []):
+            pos = fref.apply(df, pos, fparams or {})
+        eq = equity_from_position(
+            df, pos, cash_start=cash_start * w,
+            fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps,
+            fee_on_sell_only=fee_on_sell_only, stop_loss_pct=stop_loss_pct
+        )
         equities.append(eq)
         stats[getattr(ref, 'NAME', str(ref))] = {'final': float(eq.iloc[-1])}
         per[getattr(ref, 'NAME', str(ref))] = eq
