@@ -127,10 +127,21 @@ def apply_time_filter(dfi, mode):
         return dfi.loc[dfi.index >= dfi.index.max() - pd.Timedelta(days=30)]
     return dfi
 
+# ----- Nouveaux modes d'affichage + options -----
 display_mode = st.sidebar.radio(
     "Type de courbe",
-    ["Équité (portefeuille)", "Prix (actif)", "Équité par stratégie"],
+    [
+        "Équité (portefeuille)",
+        "Prix (actif)",
+        "Équité par stratégie",
+        "Chandelier (OHLC)",
+        "Drawdown",
+        "Rendement cumulé (%)",
+        "Sharpe roulant",
+    ],
 )
+log_scale = st.sidebar.checkbox("Échelle log (prix/ohlc)", value=False)
+win_sharpe = st.sidebar.slider("Fenêtre Sharpe roulant", 20, 500, 252, 10)
 
 # ------------------ Filtres de risque ------------------
 st.sidebar.subheader("Filtres de risque")
@@ -244,7 +255,8 @@ if current_config != st.session_state["last_config"]:
 # ------------------ Graph principal ------------------
 if dfs:
     fig = go.Figure()
-    if display_mode == "Équité (portefeuille)" and not equity.empty:
+
+    if display_mode == "Équité (portefeuille)" and isinstance(equity, pd.Series) and not equity.empty:
         for sym, dfi in dfs.items():
             dfi_filtered = apply_time_filter(dfi, time_filter)
             if sym in selected_symbols:
@@ -253,12 +265,13 @@ if dfs:
                     fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
                 )
                 fig.add_trace(go.Scatter(x=dfi_filtered.index, y=eq, mode="lines", name=f"Équité {sym}"))
+
     elif display_mode == "Prix (actif)":
         for sym, dfi in dfs.items():
             dfi_filtered = apply_time_filter(dfi, time_filter)
             if sym in selected_symbols:
                 fig.add_trace(go.Scatter(x=dfi_filtered.index, y=dfi_filtered["close"], mode="lines", name=f"{sym} (close)"))
-
+                # Triangles entrées/sorties
                 if triangle_strategy != "Aucune":
                     for ref, params in active:
                         if getattr(ref, "NAME", "") == triangle_strategy:
@@ -267,7 +280,6 @@ if dfs:
                                 pos = fref.apply(dfi_filtered, pos, fparams)
                             entries = pos[(pos.shift(1) == 0) & (pos == 1)].index
                             exits   = pos[(pos.shift(1) == 1) & (pos == 0)].index
-
                             fig.add_trace(go.Scatter(
                                 x=entries, y=dfi_filtered.loc[entries, "close"],
                                 mode="markers", marker_symbol="triangle-up",
@@ -280,24 +292,86 @@ if dfs:
                                 marker_color="red", marker_size=10,
                                 name=f"Vente — {getattr(ref,'NAME','')}"
                             ))
-
                             nb_trades = int(((pos.diff().fillna(0) != 0).sum()) // 2)
                             fig.add_annotation(
-                                xref="paper", yref="paper",
-                                x=0.01, y=0.95,
+                                xref="paper", yref="paper", x=0.01, y=0.95,
                                 text=f"Trades : {nb_trades}",
-                                showarrow=False,
-                                font=dict(size=12, color="white"),
-                                align="left",
-                                bordercolor="gray",
-                                borderwidth=1,
-                                bgcolor="black",
-                                opacity=0.7
+                                showarrow=False, font=dict(size=12, color="white"),
+                                align="left", bordercolor="gray", borderwidth=1,
+                                bgcolor="black", opacity=0.7
                             )
+
+    elif display_mode == "Chandelier (OHLC)":
+        for sym, dfi in dfs.items():
+            dfi_filtered = apply_time_filter(dfi, time_filter)
+            if sym in selected_symbols and {"open","high","low","close"}.issubset(dfi_filtered.columns):
+                fig.add_trace(go.Candlestick(
+                    x=dfi_filtered.index,
+                    open=dfi_filtered["open"], high=dfi_filtered["high"],
+                    low=dfi_filtered["low"], close=dfi_filtered["close"],
+                    name=f"{sym} OHLC"
+                ))
+                # Triangles entrées/sorties sur OHLC
+                if triangle_strategy != "Aucune":
+                    for ref, params in active:
+                        if getattr(ref, "NAME", "") == triangle_strategy:
+                            pos = ref.generate_signals(dfi_filtered, params)
+                            for fref, fparams in active_filters:
+                                pos = fref.apply(dfi_filtered, pos, fparams)
+                            entries = pos[(pos.shift(1) == 0) & (pos == 1)].index
+                            exits   = pos[(pos.shift(1) == 1) & (pos == 0)].index
+                            fig.add_trace(go.Scatter(
+                                x=entries, y=dfi_filtered.loc[entries, "low"],
+                                mode="markers", marker_symbol="triangle-up",
+                                marker_color="green", marker_size=10,
+                                name=f"Achat — {getattr(ref,'NAME','')}"
+                            ))
+                            fig.add_trace(go.Scatter(
+                                x=exits, y=dfi_filtered.loc[exits, "high"],
+                                mode="markers", marker_symbol="triangle-down",
+                                marker_color="red", marker_size=10,
+                                name=f"Vente — {getattr(ref,'NAME','')}"
+                            ))
+
+    elif display_mode == "Drawdown" and isinstance(equity, pd.Series) and not equity.empty:
+        for sym, dfi in dfs.items():
+            dfi_filtered = apply_time_filter(dfi, time_filter)
+            if sym in selected_symbols:
+                eq_sym, _, _ = backtest_portfolio(
+                    dfi_filtered, active, cash_start=10_000.0, filters=active_filters,
+                    fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                )
+                dd = (eq_sym / eq_sym.cummax() - 1.0) * 100.0
+                fig.add_trace(go.Scatter(x=dd.index, y=dd, mode="lines", name=f"DD {sym} (%)"))
+
+    elif display_mode == "Rendement cumulé (%)":
+        for sym, dfi in dfs.items():
+            dfi_filtered = apply_time_filter(dfi, time_filter)
+            if sym in selected_symbols:
+                base = float(dfi_filtered["close"].iloc[0])
+                rc = (dfi_filtered["close"] / base - 1.0) * 100.0
+                fig.add_trace(go.Scatter(x=rc.index, y=rc, mode="lines", name=f"{sym} (%)"))
+
+    elif display_mode == "Sharpe roulant":
+        for sym, dfi in dfs.items():
+            dfi_filtered = apply_time_filter(dfi, time_filter)
+            if sym in selected_symbols:
+                rets = dfi_filtered["close"].pct_change().fillna(0.0)
+                mu = rets.rolling(win_sharpe).mean()
+                sd = rets.rolling(win_sharpe).std().replace(0, 1e-12)
+                sh = (mu / sd) * np.sqrt(252.0)
+                fig.add_trace(go.Scatter(x=sh.index, y=sh, mode="lines", name=f"Sharpe {sym} (w={win_sharpe})"))
+
     else:
-        if per:
+        # Équité par stratégie
+        if isinstance(per, dict) and per:
             for name, eq in per.items():
                 fig.add_trace(go.Scatter(x=list(dfs.values())[0].index, y=eq, mode="lines", name=f"Équité — {name}"))
+
+    # Échelle log pour prix/ohlc si demandé
+    if log_scale and display_mode in ["Prix (actif)", "Chandelier (OHLC)"]:
+        fig.update_yaxes(type="log")
+
     fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
     st.plotly_chart(fig, use_container_width=True)
 
@@ -479,10 +553,8 @@ if st.button("🔍 Auto-calcul best values"):
         st.warning("Charge des données et coche au moins une stratégie.")
     else:
         best_params = {}
-        # Première courbe comme référence d’optimisation
         df_ref = list(dfs.values())[0]
 
-        # mapping nom -> info
         for name in active_names:
             info = infos[name]
             st.write(f"Optimisation '{name}'…")
@@ -506,12 +578,10 @@ if st.button("🔍 Auto-calcul best values"):
             )
             best_params[name] = {k: v for k, v in best.items() if k in ("params","final","sharpe","dd","growth","stab")}
 
-            # Applique paramètres stratégie
             if "params" in best:
                 st.session_state["__params"][name] = best["params"]
 
-        # Applique paramètres de filtres si optimisés
-        if opt_filters and active_filters and "filters_params" in best:
+        if opt_filters and 'best' in locals() and "filters_params" in best:
             for (fref, _), fparams in zip(active_filters, best["filters_params"]):
                 st.session_state["__params"][f"[FILTER]{getattr(fref,'NAME',str(fref))}"] = fparams
 
@@ -520,10 +590,9 @@ if st.button("🔍 Auto-calcul best values"):
             json.dump(best_params, f, indent=2)
         st.success("✅ Paramètres appliqués et sauvegardés (best_params.json)")
 
-
-
 # ------------------ Footer ------------------
 st.caption(
     """Astuce : utilisez le menu **Type de courbe** (à gauche) pour passer de l'**Équité**
-au **Prix** ou à l'**Équité par stratégie**. Ajoutez vos propres stratégies dans `/strats` et vos filtres de risque dans `/filter`."""
+au **Prix**, au **Chandelier (OHLC)**, au **Drawdown**, au **Rendement cumulé (%)** ou au **Sharpe roulant**.
+Ajoutez vos propres stratégies dans `/strats` et vos filtres de risque dans `/filter`."""
 )
