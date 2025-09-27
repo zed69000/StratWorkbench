@@ -1,5 +1,5 @@
 NAME = "Cooldown"
-PARAMS_SCHEMA = {"min_hold": {"type":"int","min":1,"max":50,"step":1,"default":5}}
+PARAMS_SCHEMA = {"min_hold": {"type":"int","min":1,"max":240,"step":1,"default":25}}
 import pandas as pd
 def apply(df, pos: pd.Series, params: dict):
     n = int(params.get("min_hold",5))

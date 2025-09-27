@@ -457,20 +457,34 @@ with st.expander("🚀 Benchmark multi-courbes", expanded=False):
         st.dataframe(pivot_all)
 
 # ------------------ Optimisation auto ------------------
+# ------------------ Optimisation auto ------------------
 st.markdown("### 🤖 Auto-calcul des meilleurs paramètres")
-if st.button("🔍 Auto-calcul best values"):
-    best_params = {}
-    for name, info in infos.items():
-        st.write(f"Optimisation {name}...")
-        best = optimize_strategy(list(dfs.values())[0], info) if dfs else {}
-        best_params[name] = best
-        if "params" in best:
-            st.session_state["__params"][name] = best["params"]
+if st.button("🔍 Auto-calcul best values (strats sélectionnées)"):
+    if not dfs or not active_names:
+        st.warning("Active au moins une stratégie et charge des données.")
+    else:
+        # Data de référence = 1er symbole sélectionné sinon 1er dispo, + filtre temps
+        base_label = selected_symbols[0] if selected_symbols else list(dfs.keys())[0]
+        dfi = apply_time_filter(dfs[base_label], time_filter)
 
-    st.json(best_params)
-    with open("best_params.json", "w") as f:
-        json.dump(best_params, f, indent=2)
-    st.success("✅ Paramètres appliqués et sauvegardés (best_params.json)")
+        best_params = {}
+        for name in active_names:
+            info = infos[name]
+            st.write(f"Optimisation {name}…")
+            best = optimize_strategy(
+                dfi, info, cash_start=10_000.0,
+                fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps,
+                fee_on_sell_only=fee_on_sell_only, filters=active_filters
+            ) or {}
+            best_params[name] = best
+            if best.get("params"):
+                st.session_state["__params"][name] = best["params"]
+
+        st.json(best_params)
+        with open("best_params.json", "w") as f:
+            json.dump(best_params, f, indent=2)
+        st.success("✅ Paramètres appliqués pour les stratégies sélectionnées")
+
 
 # ------------------ Footer ------------------
 st.caption(
