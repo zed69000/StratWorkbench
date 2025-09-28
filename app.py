@@ -116,6 +116,14 @@ time_filter = st.sidebar.selectbox(
     ["Tout", "1 Jour", "1 Semaine", "1 Mois"]
 )
 
+# --- NOUVEAU: sélecteur de mode portefeuille ---
+port_mode = st.sidebar.radio(
+    "Mode portefeuille",
+    ["Capital partagé (1 seul PnL)", "Capital divisé (somme des PnL)"],
+    index=0,
+    help="Partagé: on moyenne les positions et on calcule une seule équité avec tout le capital.\nDivisé: on fractionne le capital entre les stratégies puis on somme leurs équités."
+)
+
 def apply_time_filter(dfi, mode):
     if not isinstance(dfi.index, pd.DatetimeIndex):
         return dfi
@@ -225,7 +233,7 @@ st.markdown("---")
 # ------------------ Backtest ------------------
 CASH_START = 10_000.0
 
-def build_positions_and_individual_equities(dfi, active_list, filters, fee_bps, spread_bps, slippage_bps, fee_on_sell_only):
+def _build_positions_and_individual_equities(dfi, active_list, filters, fee_bps, spread_bps, slippage_bps, fee_on_sell_only):
     """
     Retourne (pos_port, per_dict)
     pos_port : Series exposition de portefeuille agrégée (moyenne des positions)
@@ -248,7 +256,7 @@ def build_positions_and_individual_equities(dfi, active_list, filters, fee_bps, 
         positions_df = pd.concat(positions, axis=1).fillna(0)
         pos_port = positions_df.mean(axis=1)  # exposition portefeuille partagée (moyenne simple)
 
-        # calcul des équités individuelles pour affichage/debug
+        # équités individuelles pour affichage/debug (sur capital fractionné)
         w = 1.0 / max(1, len(positions))
         for i, (ref, params) in enumerate(active_list):
             idx_name = getattr(ref, "NAME", str(ref))
@@ -259,30 +267,51 @@ def build_positions_and_individual_equities(dfi, active_list, filters, fee_bps, 
                     fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
                 )
             except Exception:
-                # fallback si equity_from_position échoue pour une strat individuelle
                 eqi = pd.Series(CASH_START * w, index=dfi.index)
             per[idx_name] = eqi
 
     return pos_port, per
 
-if dfs and active:
-    label, df0 = list(dfs.items())[0]
-    pos_port, per = build_positions_and_individual_equities(
-        df0, active, active_filters,
-        fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
-    )
-    try:
+def compute_portfolio(dfi, active_list, filters, mode, cash_start, fee_bps, spread_bps, slippage_bps, fee_on_sell_only):
+    """
+    Calcule l'équité portefeuille selon le mode choisi.
+    Retourne (equity_series, per_dict)
+    """
+    if not active_list:
+        return pd.Series(dtype=float), {}
+
+    if mode.startswith("Capital partagé"):
+        pos_port, per = _build_positions_and_individual_equities(
+            dfi, active_list, filters, fee_bps, spread_bps, slippage_bps, fee_on_sell_only
+        )
         equity = equity_from_position(
-            df0, pos_port,
-            cash_start=CASH_START,
+            dfi, pos_port,
+            cash_start=cash_start,
             fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
         )
+        return equity, per
+    else:
+        equity, stats, per = backtest_portfolio(
+            dfi, active_list, cash_start=cash_start, filters=filters,
+            fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+        )
+        return equity, per
+
+if dfs and active:
+    label, df0 = list(dfs.items())[0]
+    try:
+        equity, per = compute_portfolio(
+            df0, active, active_filters, port_mode, CASH_START,
+            fee_bps, spread_bps, slippage_bps, fee_on_sell_only
+        )
     except Exception:
-        equity = pd.Series(dtype=float)
-    gi, si = (growth_index(equity) if not equity.empty else 0.0), (stability_index(equity) if not equity.empty else 0.0)
+        equity, per = pd.Series(dtype=float), {}
+    gi = growth_index(equity) if not equity.empty else 0.0
+    si = stability_index(equity) if not equity.empty else 0.0
     kpi_port.metric("Portefeuille", f"{equity.iloc[-1]:,.0f} €" if not equity.empty else "—")
     kpi_growth.metric("Indice de croissance", f"{gi:.0f}")
     kpi_stab.metric("Indice de stabilité", f"{si:.0f}")
+    st.caption(f"Mode: {port_mode} • Base: {label} • Stratégies actives: {len(active)} • Capital total: {CASH_START:,.0f} €")
 else:
     equity, per = pd.Series(dtype=float), {}
 
@@ -297,6 +326,7 @@ current_config = {
     "filters": {f"[FILTER]{getattr(ref,'NAME',str(ref))}": params for ref, params in active_filters},
     "fees": dict(fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only),
     "time_filter": time_filter,
+    "port_mode": port_mode,
 }
 if current_config != st.session_state["last_config"]:
     st.session_state["benchmark_results"] = None
@@ -310,15 +340,10 @@ if dfs:
         for sym, dfi in dfs.items():
             dfi_filtered = apply_time_filter(dfi, time_filter)
             if sym in selected_symbols:
-                pos_port_sym, _ = build_positions_and_individual_equities(
-                    dfi_filtered, active, active_filters,
-                    fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
-                )
                 try:
-                    eq = equity_from_position(
-                        dfi_filtered, pos_port_sym,
-                        cash_start=CASH_START,
-                        fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                    eq, _ = compute_portfolio(
+                        dfi_filtered, active, active_filters, port_mode, CASH_START,
+                        fee_bps, spread_bps, slippage_bps, fee_on_sell_only
                     )
                 except Exception:
                     eq = pd.Series(dtype=float)
@@ -395,15 +420,10 @@ if dfs:
         for sym, dfi in dfs.items():
             dfi_filtered = apply_time_filter(dfi, time_filter)
             if sym in selected_symbols:
-                pos_port_sym, _ = build_positions_and_individual_equities(
-                    dfi_filtered, active, active_filters,
-                    fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
-                )
                 try:
-                    eq_sym = equity_from_position(
-                        dfi_filtered, pos_port_sym,
-                        cash_start=CASH_START,
-                        fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                    eq_sym, _ = compute_portfolio(
+                        dfi_filtered, active, active_filters, port_mode, CASH_START,
+                        fee_bps, spread_bps, slippage_bps, fee_on_sell_only
                     )
                 except Exception:
                     eq_sym = pd.Series(dtype=float)
@@ -429,7 +449,7 @@ if dfs:
                 fig.add_trace(go.Scatter(x=sh.index, y=sh, mode="lines", name=f"Sharpe {sym} (w={win_sharpe})"))
 
     else:
-        # Équité par stratégie
+        # Équité par stratégie (affichage)
         if isinstance(per, dict) and per:
             for name, eq in per.items():
                 fig.add_trace(go.Scatter(x=list(dfs.values())[0].index, y=eq, mode="lines", name=f"Équité — {name}"))
@@ -440,6 +460,23 @@ if dfs:
 
     fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
     st.plotly_chart(fig, use_container_width=True)
+
+# ------------------ Détail portefeuille pour compréhension ------------------
+if isinstance(equity, pd.Series) and not equity.empty:
+    with st.expander("🧮 Détail portefeuille", expanded=False):
+        if per:
+            df_per = pd.DataFrame({k: v for k, v in per.items()})
+            last = df_per.iloc[-1].rename("final")
+            n = len(per)
+            init_per = (CASH_START / n) if n > 0 else 0.0
+            pnl = (last - init_per).rename("PnL")
+            tab = pd.concat([last, pnl], axis=1)
+            st.dataframe(tab.style.format({"final":"{:,.0f}", "PnL":"{:,.0f}"}))
+            st.caption(f"Somme des finales: {last.sum():,.0f} €  | Valeur KPI Portefeuille: {equity.iloc[-1]:,.0f} €")
+            if port_mode.startswith("Capital partagé"):
+                st.caption("En mode 'partagé', la somme ci-dessus est un repère. La vérité du PnL est la courbe portefeuille unique.")
+            else:
+                st.caption("En mode 'divisé', Somme(individuelles) = Portefeuille.")
 
 # ------------------ Benchmark multi-courbes ------------------
 with st.expander("🚀 Benchmark multi-courbes", expanded=False):
