@@ -22,6 +22,8 @@ FILTER_DIR = str(pathlib.Path(__file__).resolve().parent / "filter")
 
 if "__params" not in st.session_state:
     st.session_state["__params"] = {}
+if "__active_filters" not in st.session_state:
+    st.session_state["__active_filters"] = []
 if "benchmark_results" not in st.session_state:
     st.session_state["benchmark_results"] = None
 if "last_config" not in st.session_state:
@@ -159,7 +161,13 @@ if not filters_infos:
     st.sidebar.caption("Aucun filtre dans /filter")
 else:
     for name, info in filters_infos.items():
-        if st.sidebar.checkbox(f"Filtre — {name}", value=False):
+        default_active = name in st.session_state.get("__active_filters", [])
+        _chk = st.sidebar.checkbox(f"Filtre — {name}", value=default_active, key=f"filter_active::{name}")
+        if _chk and not default_active:
+            st.session_state["__active_filters"].append(name)
+        if not _chk and default_active:
+            st.session_state["__active_filters"] = [n for n in st.session_state["__active_filters"] if n != name]
+        if _chk:
             with st.sidebar.expander(f"Paramètres — {name}", expanded=False):
                 params = st.session_state["__params"].get(f"[FILTER]{name}", {})
                 new_params: dict = {}
@@ -699,11 +707,16 @@ if st.button("🔍 Auto-calcul best values"):
         # Applique paramètres de filtres si optimisés
         if opt_filters and 'best' in locals() and "filters_params" in best:
             for (fref, _), fparams in zip(active_filters, best["filters_params"]):
-                st.session_state["__params"][f"[FILTER]{getattr(fref,'NAME',str(fref))}"] = fparams
+                _fname = getattr(fref, "NAME", str(fref))
+                st.session_state["__params"][f"[FILTER]{_fname}"] = fparams
+                if _fname not in st.session_state.get("__active_filters", []):
+                    st.session_state["__active_filters"].append(_fname)
 
         st.json(best_params)
-        with open("best_params.json", "w") as f:
-            json.dump(best_params, f, indent=2)
+        _root_filters = {f"[FILTER]{n}": st.session_state["__params"].get(f"[FILTER]{n}", {}) for n in st.session_state.get("__active_filters", [])}
+        _export_payload = {"filters": _root_filters, **best_params}
+        with open("best_params.json", "w", encoding="utf-8") as f:
+            json.dump(_export_payload, f, indent=2, ensure_ascii=False)
         st.success("✅ Paramètres appliqués et sauvegardés (best_params.json)")
         
 # --- Charger des params optimisés (JSON ou CSV) ---
