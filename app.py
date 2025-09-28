@@ -223,14 +223,64 @@ for i, name in enumerate(active_names):
 st.markdown("---")
 
 # ------------------ Backtest ------------------
+CASH_START = 10_000.0
+
+def build_positions_and_individual_equities(dfi, active_list, filters, fee_bps, spread_bps, slippage_bps, fee_on_sell_only):
+    """
+    Retourne (pos_port, per_dict)
+    pos_port : Series exposition de portefeuille agrégée (moyenne des positions)
+    per_dict : {strat_name: equity_series} équité individuelle calculée avec cash_start fractionné
+    """
+    positions = []
+    per = {}
+    if not active_list:
+        return pd.Series(0, index=dfi.index), per
+
+    for ref, params in active_list:
+        pos = ref.generate_signals(dfi, params)
+        for fref, fparams in filters:
+            pos = fref.apply(dfi, pos, fparams)
+        pos = pos.fillna(0).astype(float)
+        positions.append(pos)
+    if not positions:
+        pos_port = pd.Series(0, index=dfi.index)
+    else:
+        positions_df = pd.concat(positions, axis=1).fillna(0)
+        pos_port = positions_df.mean(axis=1)  # exposition portefeuille partagée (moyenne simple)
+
+        # calcul des équités individuelles pour affichage/debug
+        w = 1.0 / max(1, len(positions))
+        for i, (ref, params) in enumerate(active_list):
+            idx_name = getattr(ref, "NAME", str(ref))
+            try:
+                eqi = equity_from_position(
+                    dfi, positions[i],
+                    cash_start=CASH_START * w,
+                    fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                )
+            except Exception:
+                # fallback si equity_from_position échoue pour une strat individuelle
+                eqi = pd.Series(CASH_START * w, index=dfi.index)
+            per[idx_name] = eqi
+
+    return pos_port, per
+
 if dfs and active:
     label, df0 = list(dfs.items())[0]
-    equity, stats, per = backtest_portfolio(
-        df0, active, cash_start=10_000.0, filters=active_filters,
+    pos_port, per = build_positions_and_individual_equities(
+        df0, active, active_filters,
         fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
     )
-    gi, si = growth_index(equity), stability_index(equity)
-    kpi_port.metric("Portefeuille", f"{equity.iloc[-1]:,.0f} €")
+    try:
+        equity = equity_from_position(
+            df0, pos_port,
+            cash_start=CASH_START,
+            fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+        )
+    except Exception:
+        equity = pd.Series(dtype=float)
+    gi, si = (growth_index(equity) if not equity.empty else 0.0), (stability_index(equity) if not equity.empty else 0.0)
+    kpi_port.metric("Portefeuille", f"{equity.iloc[-1]:,.0f} €" if not equity.empty else "—")
     kpi_growth.metric("Indice de croissance", f"{gi:.0f}")
     kpi_stab.metric("Indice de stabilité", f"{si:.0f}")
 else:
@@ -260,10 +310,18 @@ if dfs:
         for sym, dfi in dfs.items():
             dfi_filtered = apply_time_filter(dfi, time_filter)
             if sym in selected_symbols:
-                eq, _, _ = backtest_portfolio(
-                    dfi_filtered, active, cash_start=10_000.0, filters=active_filters,
+                pos_port_sym, _ = build_positions_and_individual_equities(
+                    dfi_filtered, active, active_filters,
                     fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
                 )
+                try:
+                    eq = equity_from_position(
+                        dfi_filtered, pos_port_sym,
+                        cash_start=CASH_START,
+                        fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                    )
+                except Exception:
+                    eq = pd.Series(dtype=float)
                 fig.add_trace(go.Scatter(x=dfi_filtered.index, y=eq, mode="lines", name=f"Équité {sym}"))
 
     elif display_mode == "Prix (actif)":
@@ -337,11 +395,19 @@ if dfs:
         for sym, dfi in dfs.items():
             dfi_filtered = apply_time_filter(dfi, time_filter)
             if sym in selected_symbols:
-                eq_sym, _, _ = backtest_portfolio(
-                    dfi_filtered, active, cash_start=10_000.0, filters=active_filters,
+                pos_port_sym, _ = build_positions_and_individual_equities(
+                    dfi_filtered, active, active_filters,
                     fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
                 )
-                dd = (eq_sym / eq_sym.cummax() - 1.0) * 100.0
+                try:
+                    eq_sym = equity_from_position(
+                        dfi_filtered, pos_port_sym,
+                        cash_start=CASH_START,
+                        fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                    )
+                except Exception:
+                    eq_sym = pd.Series(dtype=float)
+                dd = (eq_sym / eq_sym.cummax() - 1.0) * 100.0 if not eq_sym.empty else pd.Series(dtype=float)
                 fig.add_trace(go.Scatter(x=dd.index, y=dd, mode="lines", name=f"DD {sym} (%)"))
 
     elif display_mode == "Rendement cumulé (%)":
@@ -567,7 +633,7 @@ if st.button("🔍 Auto-calcul best values"):
             with st.spinner(f"Optimisation '{name}' en cours"):
                 best = optimize_strategy(
                     df_ref, info,
-                    cash_start=10_000.0,
+                    cash_start=CASH_START,
                     max_combos=max_combos,
                     fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps,
                     fee_on_sell_only=fee_on_sell_only,
