@@ -602,6 +602,66 @@ if st.button("🔍 Auto-calcul best values"):
         with open("best_params.json", "w") as f:
             json.dump(best_params, f, indent=2)
         st.success("✅ Paramètres appliqués et sauvegardés (best_params.json)")
+        
+# --- Charger des params optimisés (JSON ou CSV) ---
+uploaded_best = st.file_uploader("Charger best_params (JSON ou CSV) — appliquer aux stratégies et filtres", type=["json","csv"])
+def _try_cast(v):
+    # convertit string -> int/float/bool si possible
+    if isinstance(v, (int, float, bool)) or v is None:
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if s.lower() in ("true","false"):
+            return s.lower() == "true"
+        try:
+            if "." in s:
+                return float(s)
+            return int(s)
+        except Exception:
+            try:
+                return float(s)
+            except Exception:
+                return s
+    return v
+
+if uploaded_best is not None:
+    try:
+        if uploaded_best.name.lower().endswith(".json"):
+            data = json.load(uploaded_best)
+            # attendu : { "StratName": { "params": {...}, "final":..., ... }, ... }
+            for strat_name, payload in data.items():
+                params = payload.get("params") if isinstance(payload, dict) else payload
+                if isinstance(params, dict):
+                    st.session_state["__params"][strat_name] = {k: _try_cast(v) for k, v in params.items()}
+            # cas où les filtres sont au niveau racine ou sous chaque stratégie
+            for k, v in (data.get("filters", {}) if isinstance(data, dict) else {}).items():
+                st.session_state["__params"][k] = {kk: _try_cast(vv) for kk, vv in v.items()}
+            st.success("✅ Paramètres JSON appliqués aux stratégies et filtres")
+
+        else:  # CSV
+            dfp = pd.read_csv(uploaded_best)
+            cols = set(dfp.columns.str.lower())
+            # format long : strat,param,value
+            if {"strat","param","value"}.issubset(cols):
+                dfp.columns = [c.lower() for c in dfp.columns]
+                pivot = dfp.pivot(index="strat", columns="param", values="value")
+                for strat in pivot.index:
+                    row = pivot.loc[strat].to_dict()
+                    st.session_state["__params"][strat] = {k: _try_cast(v) for k, v in row.items() if pd.notna(v)}
+                st.success("✅ CSV long appliqué")
+            else:
+                # format large : colonne 0 = strat (ou index), autres colonnes = params
+                if "strat" in cols:
+                    dfp = dfp.set_index([c for c in dfp.columns if c.lower()=="strat"][0])
+                else:
+                    dfp = dfp.set_index(dfp.columns[0])
+                for strat, row in dfp.iterrows():
+                    params = {c: _try_cast(row[c]) for c in dfp.columns if pd.notna(row[c])}
+                    st.session_state["__params"][strat] = params
+                st.success("✅ CSV large appliqué")
+
+    except Exception as e:
+        st.error(f"Erreur lors du chargement des paramètres : {e}")
 
 # ------------------ Footer ------------------
 st.caption(
