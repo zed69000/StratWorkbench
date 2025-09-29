@@ -778,6 +778,21 @@ if uploaded_best is not None:
 
     except Exception as e:
         st.error(f"Erreur lors du chargement des paramètres : {e}")
+        
+# ------------------ Sauvegarde manuelle des paramètres ------------------
+if st.button("💾 Sauvegarder stratégies + filtres"):
+    export_payload = {
+        "strategies": active_names,
+        "params": {k: st.session_state["__params"].get(k, {}) for k in active_names},
+        "filters": {k: st.session_state["__params"].get(k, {}) for k in st.session_state["__params"] if k.startswith("[FILTER]")},
+        "fees": dict(fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only),
+        "port_mode": port_mode,
+        "time_filter": time_filter,
+    }
+    with open("saved_params.json", "w") as f:
+        json.dump(export_payload, f, indent=2)
+    st.success("✅ Stratégies et filtres sauvegardés dans saved_params.json")
+
 
 # ------------------ Footer ------------------
 st.caption(
