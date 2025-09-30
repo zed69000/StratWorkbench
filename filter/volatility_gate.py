@@ -1,7 +1,7 @@
 NAME = "Volatility gate (ATR)"
 PARAMS_SCHEMA = {"window":{"type":"int","min":5,"max":100,"step":1,"default":14},
                  "min_atr_pct":{"type":"float","min":0.0,"max":5.0,"step":0.1,"default":0.5}}
-import pandas as pd, np as _np
+import pandas as pd, numpy as _np
 def _atr(df, w):
     tr = pd.concat([(df['high']-df['low']).abs(),
                    (df['high']-df['close'].shift(1)).abs(),
