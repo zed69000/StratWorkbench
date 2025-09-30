@@ -7,7 +7,7 @@ import math
 import pandas as pd
 
 from .engine import run_strategy
-from .metrics import equity_from_position, sharpe, growth_index, stability_index, max_drawdown
+from .metrics import equity_from_position, sharpe, growth_index, stability_index, max_drawdown, Fees
 
 # -------- helpers: grilles --------
 def _values_from_spec(spec: Dict[str, Any]) -> List[Any]:
@@ -163,11 +163,10 @@ def optimize_strategy(
                 filt_params_list.append(fp)
 
             # équité + stats
-            eq = equity_from_position(
-                df, pos, cash_start=cash_start,
-                fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps,
-                fee_on_sell_only=fee_on_sell_only, stop_loss_pct=stop_loss_pct
-            )
+            fees = Fees(maker_bps=fee_bps, taker_bps=fee_bps,
+                        spread_bps=spread_bps, slippage_bps=slippage_bps,
+                        fee_on_sell_only=fee_on_sell_only)
+            eq = equity_from_position(df, pos, cash_start=cash_start, fees=fees, stop_loss_pct=stop_loss_pct)
             stats = {
                 "params": p_strat,
                 "final": float(eq.iloc[-1]) if len(eq) else 0.0,

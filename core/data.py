@@ -1,5 +1,6 @@
 from __future__ import annotations
 import numpy as np, pandas as pd
+from typing import Dict
 
 def _gbm(n, start=100.0, mu=0.08, sigma=0.2, dt=1/252, seed=None):
     rng = np.random.default_rng(seed)
@@ -57,3 +58,19 @@ def load_csv(path: str) -> pd.DataFrame:
 
     return df[required]
 
+_SYNTH_KIND_SEED: Dict[str, int] = {
+    "sideways": 11, "slow_grind": 23, "trend_down": 37, "trend_up": 53, "volatile_whipsaw": 71,
+}
+def make_with_jitter(kind: str, n_points: int, seed: int, jitter_pct: float) -> pd.DataFrame:
+    df = make_synth(n=n_points, kind=kind, seed=seed)
+    if jitter_pct and jitter_pct > 0:
+        base_seed = int(seed * 10007 + _SYNTH_KIND_SEED.get(kind, 97)) % (2**32)
+        rng = np.random.default_rng(base_seed)
+        noise = pd.Series(rng.normal(0, jitter_pct / 1000.0, size=len(df)), index=df.index)
+        noise = noise.rolling(window=10, min_periods=1).mean()
+        df["close"] *= (1 + noise)
+        df["open"] = df["close"].shift(1).fillna(df["close"])
+        absn = noise.abs()
+        df["high"] = df[["open", "close"]].max(axis=1) * (1 + absn / 2)
+        df["low"]  = df[["open", "close"]].min(axis=1) * (1 - absn / 2)
+    return df
