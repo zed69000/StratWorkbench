@@ -5,29 +5,14 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import numpy as np
+import json
 
-from core.data import load_csv, make_with_jitter
-from core.io import load_params_from_file, save_params_json
-from core.engine import discover_strategies, discover_filters
-from core.portfolio import compute_portfolio, apply_time_filter
-from core.metrics import growth_index, stability_index
-from core.benchmark import run_benchmark, rankings
-from core.signals import entries_exits
-from core.optimizer import optimize_strategy
-
-from core.state import (
-    init_session,
-    assemble_config,
-    invalidate_if_changed,
-    get_benchmark,
-    set_benchmark,
-    set_params_for_strat,
-    set_params_bulk,
-    set_filter_params,
-    get_params_all,
-    get_active_filter_names,
-    add_active_filter,
+from core.data import make_synth, load_multi_curves, load_csv
+from core.engine import discover_strategies, backtest_portfolio, discover_filters
+from core.metrics import (
+    growth_index, stability_index, max_drawdown, sharpe, equity_from_position
 )
+from core.optimizer import optimize_strategy
 
 # ------------------ Config Streamlit ------------------
 st.set_page_config(page_title="StratWorkbench", layout="wide", page_icon="🧪")
@@ -35,12 +20,40 @@ st.set_page_config(page_title="StratWorkbench", layout="wide", page_icon="🧪")
 STRATS_DIR = str(pathlib.Path(__file__).resolve().parent / "strats")
 FILTER_DIR = str(pathlib.Path(__file__).resolve().parent / "filter")
 
-init_session()
+if "__params" not in st.session_state:
+    st.session_state["__params"] = {}
+if "__active_filters" not in st.session_state:
+    st.session_state["__active_filters"] = []
+if "benchmark_results" not in st.session_state:
+    st.session_state["benchmark_results"] = None
+if "last_config" not in st.session_state:
+    st.session_state["last_config"] = {}
 
 # Couleurs
 HIGHLIGHT = "#a9955ba6"
 HIGHLIGHT2 = "#b6863f"
 
+# ------------------ Helpers: synth + jitter déterministe ------------------
+_SYNTH_KIND_SEED = {
+    "sideways": 11,
+    "slow_grind": 23,
+    "trend_down": 37,
+    "trend_up": 53,
+    "volatile_whipsaw": 71,
+}
+def make_with_jitter(kind: str, n_points: int, seed: int, jitter_pct: float) -> pd.DataFrame:
+    df = make_synth(n=n_points, kind=kind, seed=seed)
+    if jitter_pct and jitter_pct > 0:
+        base_seed = int(seed * 10007 + _SYNTH_KIND_SEED.get(kind, 97)) % (2**32)
+        rng = np.random.default_rng(base_seed)
+        noise = pd.Series(rng.normal(0, jitter_pct / 1000.0, size=len(df)), index=df.index)
+        noise = noise.rolling(window=10, min_periods=1).mean()
+        df["close"] *= (1 + noise)
+        df["open"] = df["close"].shift(1).fillna(df["close"])
+        absn = noise.abs()
+        df["high"] = df[["open", "close"]].max(axis=1) * (1 + absn / 2)
+        df["low"]  = df[["open", "close"]].min(axis=1) * (1 - absn / 2)
+    return df
 
 # ------------------ Sidebar ------------------
 st.sidebar.title("⚙️ Paramètres")
@@ -112,6 +125,17 @@ port_mode = st.sidebar.radio(
     index=0,
     help="Partagé: on moyenne les positions et on calcule une seule équité avec tout le capital.\nDivisé: on fractionne le capital entre les stratégies puis on somme leurs équités."
 )
+
+def apply_time_filter(dfi, mode):
+    if not isinstance(dfi.index, pd.DatetimeIndex):
+        return dfi
+    if mode == "1 Jour":
+        return dfi.loc[dfi.index >= dfi.index.max() - pd.Timedelta(days=1)]
+    elif mode == "1 Semaine":
+        return dfi.loc[dfi.index >= dfi.index.max() - pd.Timedelta(weeks=1)]
+    elif mode == "1 Mois":
+        return dfi.loc[dfi.index >= dfi.index.max() - pd.Timedelta(days=30)]
+    return dfi
 
 # ----- Nouveaux modes d'affichage + options -----
 display_mode = st.sidebar.radio(
@@ -217,6 +241,70 @@ st.markdown("---")
 # ------------------ Backtest ------------------
 CASH_START = 10_000.0
 
+def _build_positions_and_individual_equities(dfi, active_list, filters, fee_bps, spread_bps, slippage_bps, fee_on_sell_only):
+    """
+    Retourne (pos_port, per_dict)
+    pos_port : Series exposition de portefeuille agrégée (moyenne des positions)
+    per_dict : {strat_name: equity_series} équité individuelle calculée avec cash_start fractionné
+    """
+    positions = []
+    per = {}
+    if not active_list:
+        return pd.Series(0, index=dfi.index), per
+
+    for ref, params in active_list:
+        pos = ref.generate_signals(dfi, params)
+        for fref, fparams in filters:
+            pos = fref.apply(dfi, pos, fparams)
+        pos = pos.fillna(0).astype(float)
+        positions.append(pos)
+    if not positions:
+        pos_port = pd.Series(0, index=dfi.index)
+    else:
+        positions_df = pd.concat(positions, axis=1).fillna(0)
+        pos_port = positions_df.mean(axis=1)  # exposition portefeuille partagée (moyenne simple)
+
+        # équités individuelles pour affichage/debug (sur capital fractionné)
+        w = 1.0 / max(1, len(positions))
+        for i, (ref, params) in enumerate(active_list):
+            idx_name = getattr(ref, "NAME", str(ref))
+            try:
+                eqi = equity_from_position(
+                    dfi, positions[i],
+                    cash_start=CASH_START * w,
+                    fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                )
+            except Exception:
+                eqi = pd.Series(CASH_START * w, index=dfi.index)
+            per[idx_name] = eqi
+
+    return pos_port, per
+
+def compute_portfolio(dfi, active_list, filters, mode, cash_start, fee_bps, spread_bps, slippage_bps, fee_on_sell_only):
+    """
+    Calcule l'équité portefeuille selon le mode choisi.
+    Retourne (equity_series, per_dict)
+    """
+    if not active_list:
+        return pd.Series(dtype=float), {}
+
+    if mode.startswith("Capital partagé"):
+        pos_port, per = _build_positions_and_individual_equities(
+            dfi, active_list, filters, fee_bps, spread_bps, slippage_bps, fee_on_sell_only
+        )
+        equity = equity_from_position(
+            dfi, pos_port,
+            cash_start=cash_start,
+            fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+        )
+        return equity, per
+    else:
+        equity, stats, per = backtest_portfolio(
+            dfi, active_list, cash_start=cash_start, filters=filters,
+            fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+        )
+        return equity, per
+
 if dfs and active:
     label, df0 = list(dfs.items())[0]
     try:
@@ -235,24 +323,22 @@ if dfs and active:
 else:
     equity, per = pd.Series(dtype=float), {}
 
-cfg = assemble_config(
-    data_mode=data_mode,
-    synth_seed=locals().get("synth_seed"),
-    n_points=locals().get("n_points"),
-    jitter_pct=locals().get("jitter_pct"),
-    curve_kind=locals().get("curve_kind"),
-    active_names=active_names,
-    active_filters=active_filters,
-    time_filter=time_filter,
-    port_mode=port_mode,
-    fees=dict(
-        fee_bps=fee_bps,
-        spread_bps=spread_bps,
-        slippage_bps=slippage_bps,
-        fee_on_sell_only=fee_on_sell_only,
-    ),
-)
-invalidate_if_changed(cfg)
+# ------------------ Invalidation automatique benchmark ------------------
+current_config = {
+    "seed": (locals().get("synth_seed") if data_mode == "Synthétique" else None),
+    "n_points": (locals().get("n_points") if data_mode == "Synthétique" else None),
+    "jitter": (locals().get("jitter_pct") if data_mode == "Synthétique" else None),
+    "curve_kind": (locals().get("curve_kind") if data_mode == "Synthétique" else None),
+    "strategies": active_names,
+    "params": {k: st.session_state["__params"].get(k, {}) for k in active_names},
+    "filters": {f"[FILTER]{getattr(ref,'NAME',str(ref))}": params for ref, params in active_filters},
+    "fees": dict(fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only),
+    "time_filter": time_filter,
+    "port_mode": port_mode,
+}
+if current_config != st.session_state["last_config"]:
+    st.session_state["benchmark_results"] = None
+    st.session_state["last_config"] = current_config
 
 # ------------------ Graph principal ------------------
 if dfs:
@@ -283,7 +369,8 @@ if dfs:
                             pos = ref.generate_signals(dfi_filtered, params)
                             for fref, fparams in active_filters:
                                 pos = fref.apply(dfi_filtered, pos, fparams)
-                            entries, exits, nb_trades = entries_exits(pos)
+                            entries = pos[(pos.shift(1) == 0) & (pos == 1)].index
+                            exits   = pos[(pos.shift(1) == 1) & (pos == 0)].index
                             fig.add_trace(go.Scatter(
                                 x=entries, y=dfi_filtered.loc[entries, "close"],
                                 mode="markers", marker_symbol="triangle-up",
@@ -296,6 +383,7 @@ if dfs:
                                 marker_color="red", marker_size=10,
                                 name=f"Vente — {getattr(ref,'NAME','')}"
                             ))
+                            nb_trades = int(((pos.diff().fillna(0) != 0).sum()) // 2)
                             fig.add_annotation(
                                 xref="paper", yref="paper", x=0.01, y=0.95,
                                 text=f"Trades : {nb_trades}",
@@ -321,7 +409,8 @@ if dfs:
                             pos = ref.generate_signals(dfi_filtered, params)
                             for fref, fparams in active_filters:
                                 pos = fref.apply(dfi_filtered, pos, fparams)
-                            entries, exits, _nb_trades = entries_exits(pos)
+                            entries = pos[(pos.shift(1) == 0) & (pos == 1)].index
+                            exits   = pos[(pos.shift(1) == 1) & (pos == 0)].index
                             fig.add_trace(go.Scatter(
                                 x=entries, y=dfi_filtered.loc[entries, "low"],
                                 mode="markers", marker_symbol="triangle-up",
@@ -415,16 +504,41 @@ with st.expander("🚀 Benchmark multi-courbes", expanded=False):
             else:
                 bench_dfs = dfs
 
-            res = run_benchmark(
-                bench_dfs, active, active_filters,
-                cash_start=10_000.0,
-                fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps,
-                fee_on_sell_only=fee_on_sell_only, time_filter=time_filter
-            )
-            set_benchmark(res)
+            rows = []
+            for label, dfi in bench_dfs.items():
+                dfi_filtered = apply_time_filter(dfi, time_filter)
+                for ref, params in active:
+                    pos = ref.generate_signals(dfi_filtered, params)
+                    for fref, fparams in active_filters:
+                        pos = fref.apply(dfi_filtered, pos, fparams)
+                    eqi = equity_from_position(
+                        dfi_filtered, pos, cash_start=10_000.0,
+                        fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                    )
+
+                    changes = (pos.diff().fillna(0) != 0).sum()
+                    nb_trades = int(changes // 2)
+                    if isinstance(dfi_filtered.index, pd.DatetimeIndex):
+                        n_days = max(1, (dfi_filtered.index[-1] - dfi_filtered.index[0]).days)
+                    else:
+                        n_days = max(1, len(dfi_filtered) // 100)
+                    trades_per_day = nb_trades / n_days
+
+                    rows.append({
+                        "courbe": label,
+                        "strat": getattr(ref, "NAME", str(ref)),
+                        "final": float(eqi.iloc[-1]),
+                        "growth_idx": growth_index(eqi),
+                        "stability_idx": stability_index(eqi),
+                        "dd_min": float(max_drawdown(eqi)),
+                        "sharpe": float(sharpe(eqi)),
+                        "trades": nb_trades,
+                        "trades_per_day": trades_per_day,
+                    })
+            st.session_state["benchmark_results"] = pd.DataFrame(rows).set_index(["courbe", "strat"])
 
     # Recalcul automatique si nécessaire
-    if get_benchmark() is None and dfs and active:
+    if st.session_state["benchmark_results"] is None and dfs and active:
         if data_mode == "Synthétique":
             seed = int(locals().get("synth_seed", 123))
             seed = np.random.randint(0, 1_000_000) if seed == 0 else seed
@@ -435,16 +549,42 @@ with st.expander("🚀 Benchmark multi-courbes", expanded=False):
         else:
             bench_dfs = dfs
 
-        res = run_benchmark(
-            bench_dfs, active, active_filters,
-            cash_start=10_000.0,
-            fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps,
-            fee_on_sell_only=fee_on_sell_only, time_filter=time_filter
-        )
-        set_benchmark(res)
+        rows = []
+        for label, dfi in bench_dfs.items():
+            dfi_filtered = apply_time_filter(dfi, time_filter)
+            for ref, params in active:
+                pos = ref.generate_signals(dfi_filtered, params)
+                for fref, fparams in active_filters:
+                    pos = fref.apply(dfi_filtered, pos, fparams)
+                eqi = equity_from_position(
+                    dfi_filtered, pos, cash_start=10_000.0,
+                    fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only
+                )
 
-    res = get_benchmark()
-    if res is not None:
+                changes = (pos.diff().fillna(0) != 0).sum()
+                nb_trades = int(changes // 2)
+                if isinstance(dfi_filtered.index, pd.DatetimeIndex):
+                    n_days = max(1, (dfi_filtered.index[-1] - dfi_filtered.index[0]).days)
+                else:
+                    n_days = max(1, len(dfi_filtered) // 100)
+                trades_per_day = nb_trades / n_days
+
+                rows.append({
+                    "courbe": label,
+                    "strat": getattr(ref, "NAME", str(ref)),
+                    "final": float(eqi.iloc[-1]),
+                    "growth_idx": growth_index(eqi),
+                    "stability_idx": stability_index(eqi),
+                    "dd_min": float(max_drawdown(eqi)),
+                    "sharpe": float(sharpe(eqi)),
+                    "trades": nb_trades,
+                    "trades_per_day": trades_per_day,
+                })
+        st.session_state["benchmark_results"] = pd.DataFrame(rows).set_index(["courbe", "strat"])
+
+    if st.session_state["benchmark_results"] is not None:
+        res = st.session_state["benchmark_results"]
+
         st.subheader("Équité finale par marché × stratégie")
         st.dataframe(res["final"].unstack().style.format("{:,.0f}").highlight_max(axis=1, color=HIGHLIGHT))
 
@@ -462,19 +602,42 @@ with st.expander("🚀 Benchmark multi-courbes", expanded=False):
             col4.dataframe(res["stability_idx"].unstack().style.format("{:.0f}").highlight_max(axis=1, color=HIGHLIGHT2))
 
         # ------------------ Classements supplémentaires ------------------
-        rk = rankings(res)
-        best = rk["best"]
+        best = (
+            res["final"]
+            .groupby(level=0).idxmax()
+            .apply(lambda x: x[1])
+            .rename("Meilleure stratégie (final)")
+            .to_frame()
+        )
         st.subheader("🏆 Meilleure stratégie par type de marché")
         st.dataframe(best)
 
         st.subheader("📊 Stratégies efficaces sur plusieurs types de marché")
-        st.markdown(f"**Critère absolu** (perf > médiane globale = {rk['seuil']:,.0f}€)")
-        st.dataframe(rk["pivot_abs"])
+        df_bench = res.reset_index()[["courbe", "strat", "final"]]
 
-        st.markdown(f"**Classement relatif** (nombre de fois dans le Top-{rk['topN']})")
-        st.dataframe(rk["pivot_rel"])
+        seuil = df_bench["final"].median()
+        pivot_abs = (df_bench
+                     .assign(efficace=lambda d: d["final"] > seuil)
+                     .groupby("strat")["efficace"].sum()
+                     .sort_values(ascending=False)
+                     .to_frame("nb_marches_efficaces"))
+        st.markdown(f"**Critère absolu** (perf > médiane globale = {seuil:,.0f}€)")
+        st.dataframe(pivot_abs)
 
-        pivot_all = rk["pivot_all"]
+        nb_strats = df_bench["strat"].nunique()
+        topN = max(1, nb_strats // 3)
+
+        def mark_topN(d, n=2):
+            return d.sort_values("final", ascending=False).head(n).assign(topN=True)
+
+        top_marks = (df_bench.groupby("courbe", group_keys=False).apply(mark_topN, n=topN))
+        pivot_rel = (top_marks.groupby("strat")["topN"].sum()
+                     .sort_values(ascending=False)
+                     .to_frame(f"nb_top{topN}"))
+        st.markdown(f"**Classement relatif** (nombre de fois dans le Top-{topN})")
+        st.dataframe(pivot_rel)
+
+        pivot_all = pivot_abs.join(pivot_rel, how="outer").fillna(0).astype(int)
         st.markdown("**Vue combinée (absolu + relatif)**")
         st.dataframe(pivot_all)
 
@@ -535,7 +698,7 @@ if st.button("🔍 Auto-calcul best values"):
             # Mémorise
             best_params[name] = {k: v for k, v in best.items() if k in ("params","final","sharpe","dd","growth","stab")}
             if "params" in best:
-                set_params_for_strat(name, best["params"])
+                st.session_state["__params"][name] = best["params"]
 
             progress.progress(int(i * 100 / max(1, total)))
 
@@ -545,45 +708,76 @@ if st.button("🔍 Auto-calcul best values"):
         if opt_filters and 'best' in locals() and "filters_params" in best:
             for (fref, _), fparams in zip(active_filters, best["filters_params"]):
                 _fname = getattr(fref, "NAME", str(fref))
-                set_filter_params(f"[FILTER]{_fname}", fparams or {})
-                add_active_filter(_fname)
+                st.session_state["__params"][f"[FILTER]{_fname}"] = fparams
+                if _fname not in st.session_state.get("__active_filters", []):
+                    st.session_state["__active_filters"].append(_fname)
 
         st.json(best_params)
-        _root_filters = {f"[FILTER]{n}": get_params_all().get(f"[FILTER]{n}", {}) for n in get_active_filter_names()}
+        _root_filters = {f"[FILTER]{n}": st.session_state["__params"].get(f"[FILTER]{n}", {}) for n in st.session_state.get("__active_filters", [])}
         _export_payload = {"filters": _root_filters, **best_params}
-        save_params_json("best_params.json", _export_payload)
+        with open("best_params.json", "w", encoding="utf-8") as f:
+            json.dump(_export_payload, f, indent=2, ensure_ascii=False)
         st.success("✅ Paramètres appliqués et sauvegardés (best_params.json)")
         
 # --- Charger des params optimisés (JSON ou CSV) ---
 uploaded_best = st.file_uploader("Charger best_params (JSON ou CSV) — appliquer aux stratégies et filtres", type=["json","csv"])
-
+def _try_cast(v):
+    # convertit string -> int/float/bool si possible
+    if isinstance(v, (int, float, bool)) or v is None:
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if s.lower() in ("true","false"):
+            return s.lower() == "true"
+        try:
+            if "." in s:
+                return float(s)
+            return int(s)
+        except Exception:
+            try:
+                return float(s)
+            except Exception:
+                return s
+    return v
 
 if uploaded_best is not None:
     try:
-        by_strat, filters = load_params_from_file(uploaded_best, uploaded_best.name)
-        if by_strat:
-            set_params_bulk(by_strat)
-        for k, v in (filters or {}).items():
-            set_filter_params(k, v)
-        st.success("✅ Paramètres appliqués aux stratégies et filtres")
+        if uploaded_best.name.lower().endswith(".json"):
+            data = json.load(uploaded_best)
+            # attendu : { "StratName": { "params": {...}, "final":..., ... }, ... }
+            for strat_name, payload in data.items():
+                params = payload.get("params") if isinstance(payload, dict) else payload
+                if isinstance(params, dict):
+                    st.session_state["__params"][strat_name] = {k: _try_cast(v) for k, v in params.items()}
+            # cas où les filtres sont au niveau racine ou sous chaque stratégie
+            for k, v in (data.get("filters", {}) if isinstance(data, dict) else {}).items():
+                st.session_state["__params"][k] = {kk: _try_cast(vv) for kk, vv in v.items()}
+            st.success("✅ Paramètres JSON appliqués aux stratégies et filtres")
+
+        else:  # CSV
+            dfp = pd.read_csv(uploaded_best)
+            cols = set(dfp.columns.str.lower())
+            # format long : strat,param,value
+            if {"strat","param","value"}.issubset(cols):
+                dfp.columns = [c.lower() for c in dfp.columns]
+                pivot = dfp.pivot(index="strat", columns="param", values="value")
+                for strat in pivot.index:
+                    row = pivot.loc[strat].to_dict()
+                    st.session_state["__params"][strat] = {k: _try_cast(v) for k, v in row.items() if pd.notna(v)}
+                st.success("✅ CSV long appliqué")
+            else:
+                # format large : colonne 0 = strat (ou index), autres colonnes = params
+                if "strat" in cols:
+                    dfp = dfp.set_index([c for c in dfp.columns if c.lower()=="strat"][0])
+                else:
+                    dfp = dfp.set_index(dfp.columns[0])
+                for strat, row in dfp.iterrows():
+                    params = {c: _try_cast(row[c]) for c in dfp.columns if pd.notna(row[c])}
+                    st.session_state["__params"][strat] = params
+                st.success("✅ CSV large appliqué")
 
     except Exception as e:
         st.error(f"Erreur lors du chargement des paramètres : {e}")
-        
-# ------------------ Sauvegarde manuelle des paramètres ------------------
-if st.button("💾 Sauvegarder stratégies + filtres"):
-    _all = get_params_all()
-    export_payload = {
-        "strategies": active_names,
-        "params": {k: _all.get(k, {}) for k in active_names},
-        "filters": {k: v for k, v in _all.items() if k.startswith("[FILTER]")},
-        "fees": dict(fee_bps=fee_bps, spread_bps=spread_bps, slippage_bps=slippage_bps, fee_on_sell_only=fee_on_sell_only),
-        "port_mode": port_mode,
-        "time_filter": time_filter,
-    }
-    save_params_json("saved_params.json", export_payload)
-    st.success("✅ Stratégies et filtres sauvegardés dans saved_params.json")
-
 
 # ------------------ Footer ------------------
 st.caption(
